@@ -1,16 +1,9 @@
+from dataclasses import dataclass
 from llama_cpp import Llama
 import numpy as np
+from typing import List, Tuple
 
-
-llm = Llama.from_pretrained(
-    repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF",
-    filename="*q8_0.gguf",
-    verbose=False,
-    logits_all=True,
-)
-
-
-def get_token_probs(llm, context_tokens):
+def get_token_probs(llm: Llama, context_tokens: List[int]):
     """Get probability distribution for next token given context"""
 
     if len(context_tokens) == 0:
@@ -34,26 +27,86 @@ def get_token_probs(llm, context_tokens):
 
     return probs
 
+@dataclass
+class Compressed:
+    ranks: List[int]
+    intervals: List[Tuple[int,int]]
+    final_point: float
+    num_tokens: int
 
-text = "In information theory, data compression, source coding,[1] or bit-rate reduction is the"
-tokens = llm.tokenize(text.encode("utf-8"))
 
-for i in range(10):
-    probs = get_token_probs(llm, tokens)
+def compress(llm: Llama, text: str) -> Compressed:
+    tokens = llm.tokenize(text.encode("utf-8"))
 
-    # Show top 10 most likely next tokens
-    top_k = 10
-    top_indices = np.argsort(probs)[-top_k:][::-1]
+    ranks = []
+    lo, hi = 0.0, 1.0
+    intervals: List[Tuple[int,int]] = []
+    for i, token in enumerate(tokens):
+        probs = get_token_probs(llm, tokens[:i])
+        next_tokens_sorted = np.argsort(probs)[::-1]
+        
+        rank = np.where(next_tokens_sorted == token)[0][0]
+        ranks.append(rank)
+        prob_before = np.sum(probs[next_tokens_sorted][:rank])
+        next_token_prob = probs[token]
+        print(f"rank: {rank}, prob: {next_token_prob}, prob_before: {prob_before}")
 
-    context = "".join(llm.detokenize(tokens).decode("utf-8", errors="replace"))
-    print(f"Context: {context}")
-    for idx in top_indices:
-        token_str = llm.detokenize([idx]).decode("utf-8", errors="replace")
-        print(f"Token {idx}: {token_str!r} -> {probs[idx]:.4f}")
+        width = hi - lo
+        new_lo = prob_before * width + lo
+        new_hi = (prob_before + next_token_prob) * width + lo
+        lo, hi = new_lo, new_hi
+        intervals.append((lo,hi))
 
-    actual_next_token = llm.detokenize([top_indices[0]]).decode(
-        "utf-8", errors="replace"
+    final_point = (lo + hi) / 2
+    return Compressed(ranks=ranks, intervals=intervals, final_point=final_point, num_tokens=len(tokens))
+
+def decompress(llm: Llama, compressed: Compressed) -> str:
+    lo, hi = 0.0, 1.0
+    decompressed_tokens = []
+    current_point = compressed.final_point
+    for i in range(compressed.num_tokens):
+        probs = get_token_probs(llm, decompressed_tokens)
+        next_tokens_sorted = np.argsort(probs)[::-1]
+        cdf = np.cumsum(probs[next_tokens_sorted])
+        rank = np.searchsorted(cdf, current_point)
+        token = next_tokens_sorted[rank]
+        decompressed_tokens.append(token)
+
+        prob_before = np.sum(probs[next_tokens_sorted][:rank])
+        next_token_prob = probs[token]
+        width = next_token_prob
+        current_point = (current_point - prob_before) / width
+        print(f"current_point = {current_point}, prob_before = {prob_before}")
+
+
+        print(rank)
+        
+    return "".join(llm.detokenize(decompressed_tokens).decode("utf-8", errors="replace"))
+
+    # decompressed_tokens = []
+    # for rank in compressed.ranks:
+    #     probs = get_token_probs(llm, decompressed_tokens)
+    #     next_tokens_sorted = np.argsort(probs)[::-1]
+    #     next_decompressed_token = next_tokens_sorted[rank]
+    #     decompressed_tokens.append(next_decompressed_token)
+    # decompressed_string = "".join(llm.detokenize(decompressed_tokens).decode("utf-8", errors="replace"))
+    # print(decompressed_string)
+    # return decompressed_string
+
+def main():
+    llm = Llama.from_pretrained(
+        repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF",
+        filename="*q8_0.gguf",
+        verbose=False,
+        logits_all=True,
     )
-    print(f"gonna use {actual_next_token}")
 
-    tokens.append(top_indices[0])
+    text = "The capital of the United States is New Delhi"
+    compressed = compress(llm, text)
+    print(compressed)
+    decompressed = decompress(llm, compressed)
+    print(decompressed)
+    assert decompressed == text
+
+if __name__ == "__main__":
+    main()
