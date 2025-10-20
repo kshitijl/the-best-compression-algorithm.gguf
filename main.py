@@ -1,7 +1,9 @@
 from dataclasses import dataclass
+import struct
 from llama_cpp import Llama
 import numpy as np
 from typing import List, Tuple
+
 
 def get_token_probs(llm: Llama, context_tokens: List[int]):
     """Get probability distribution for next token given context"""
@@ -27,10 +29,11 @@ def get_token_probs(llm: Llama, context_tokens: List[int]):
 
     return probs
 
+
 @dataclass
 class Compressed:
     ranks: List[int]
-    intervals: List[Tuple[int,int]]
+    intervals: List[Tuple[int, int]]
     final_point: float
     num_tokens: int
 
@@ -40,11 +43,11 @@ def compress(llm: Llama, text: str) -> Compressed:
 
     ranks = []
     lo, hi = 0.0, 1.0
-    intervals: List[Tuple[int,int]] = []
+    intervals: List[Tuple[int, int]] = []
     for i, token in enumerate(tokens):
         probs = get_token_probs(llm, tokens[:i])
         next_tokens_sorted = np.argsort(probs)[::-1]
-        
+
         rank = np.where(next_tokens_sorted == token)[0][0]
         ranks.append(rank)
         prob_before = np.sum(probs[next_tokens_sorted][:rank])
@@ -55,10 +58,16 @@ def compress(llm: Llama, text: str) -> Compressed:
         new_lo = prob_before * width + lo
         new_hi = (prob_before + next_token_prob) * width + lo
         lo, hi = new_lo, new_hi
-        intervals.append((lo,hi))
+        intervals.append((lo, hi))
 
     final_point = (lo + hi) / 2
-    return Compressed(ranks=ranks, intervals=intervals, final_point=final_point, num_tokens=len(tokens))
+    return Compressed(
+        ranks=ranks,
+        intervals=intervals,
+        final_point=final_point,
+        num_tokens=len(tokens),
+    )
+
 
 def decompress(llm: Llama, compressed: Compressed) -> str:
     lo, hi = 0.0, 1.0
@@ -78,35 +87,86 @@ def decompress(llm: Llama, compressed: Compressed) -> str:
         current_point = (current_point - prob_before) / width
         print(f"current_point = {current_point}, prob_before = {prob_before}")
 
-
         print(rank)
-        
-    return "".join(llm.detokenize(decompressed_tokens).decode("utf-8", errors="replace"))
 
-    # decompressed_tokens = []
-    # for rank in compressed.ranks:
-    #     probs = get_token_probs(llm, decompressed_tokens)
-    #     next_tokens_sorted = np.argsort(probs)[::-1]
-    #     next_decompressed_token = next_tokens_sorted[rank]
-    #     decompressed_tokens.append(next_decompressed_token)
-    # decompressed_string = "".join(llm.detokenize(decompressed_tokens).decode("utf-8", errors="replace"))
-    # print(decompressed_string)
-    # return decompressed_string
-
-def main():
-    llm = Llama.from_pretrained(
-        repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF",
-        filename="*q8_0.gguf",
-        verbose=False,
-        logits_all=True,
+    return "".join(
+        llm.detokenize(decompressed_tokens).decode("utf-8", errors="replace")
     )
 
-    text = "The capital of the United States is New Delhi"
-    compressed = compress(llm, text)
-    print(compressed)
-    decompressed = decompress(llm, compressed)
-    print(decompressed)
-    assert decompressed == text
+
+@dataclass
+class SuperFloat:
+    exp: int
+    mantissa: int
+
+    @staticmethod
+    def from_float(f: float):
+        bits = struct.unpack(">I", struct.pack(">f", f))[0]
+
+        # Extract parts using bit operations
+        sign = (bits >> 31) & 1
+        if sign > 0:
+            raise ValueError("SuperFloats must be positive")
+
+        exp = (bits >> 23) & 0xFF  # 8 bits
+        mantissa = bits & 0x7FFFFF  # 23 bits
+
+        print(f"raw exp = {exp}, mantissa = {mantissa}")
+        exp = exp - 127
+        return SuperFloat(
+            exp=exp,
+            mantissa=mantissa,
+        )
+
+    def __mul__(self, other):
+        if not isinstance(other, SuperFloat):
+            raise TypeError("expected SuperFloat")
+        exp = self.exp + other.exp
+        mantissa = self.mantissa * other.mantissa
+        while mantissa % 2 == 0 and mantissa != 0:
+            mantissa /= 2
+            exp += 1
+
+        return SuperFloat(
+            exp=exp,
+            mantissa=mantissa,
+        )
+
+
+def test_from_float():
+    half = SuperFloat.from_float(0.5)
+    quarter = SuperFloat.from_float(0.25)
+    assert half * half == quarter
+
+
+def main():
+    llms = [
+        Llama.from_pretrained(
+            repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF",
+            filename="*q8_0.gguf",
+            verbose=False,
+            logits_all=True,
+        ),
+        Llama.from_pretrained(
+            repo_id="QuantFactory/Meta-Llama-3-8B-GGUF",
+            filename="*Q8_0.gguf",
+            verbose=False,
+            logits_all=True,
+        ),
+    ]
+
+    texts = [
+        "The capital of the United States is New Delhi",
+    ]
+
+    for llm in llms:
+        for text in texts:
+            compressed = compress(llm, text)
+            print(compressed)
+            decompressed = decompress(llm, compressed)
+            print(decompressed)
+            assert decompressed == text
+
 
 if __name__ == "__main__":
     main()
