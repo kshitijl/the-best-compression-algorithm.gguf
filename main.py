@@ -1,20 +1,38 @@
-from dataclasses import dataclass
+import random
+import zlib
+import bz2
+import lzma
+import base64
 import struct
+from dataclasses import dataclass
+from typing import Callable, List, Optional
+
 from llama_cpp import Llama
 import numpy as np
-from typing import List, Tuple
+import zstd
+
+
+PRECISION = 32  # use 32bit presision b/c it fits in 64 (so overflow is easy to detect) & math is easier
+MAX_RANGE = 1 << PRECISION
+HALF = 1 << (PRECISION - 1)
+QUARTER = 1 << (PRECISION - 2)
+THREE_QUARTERS = 3 * QUARTER
+
+WINDOW_SIZE = 64  # this is the max number of tokens we will send to the LLM before resetting the context
 
 
 def get_token_probs(llm: Llama, context_tokens: List[int]):
     """Get probability distribution for next token given context"""
-
     if len(context_tokens) == 0:
         # Empty context - use BOS token or evaluate empty
         context_tokens = [llm.token_bos()]
 
+    if len(context_tokens) % WINDOW_SIZE == 0:
+        llm.reset()
+        llm.eval([llm.token_bos()])
+
     # Evaluate the context to get logits
-    llm.reset()  # Clear any previous state
-    llm.eval(context_tokens)
+    llm.eval([context_tokens[-1]])
 
     # Get logits for the last position
     logits = llm.eval_logits[-1]  # Shape: (vocab_size,)
@@ -32,139 +50,286 @@ def get_token_probs(llm: Llama, context_tokens: List[int]):
 
 @dataclass
 class Compressed:
-    ranks: List[int]
-    intervals: List[Tuple[int, int]]
-    final_point: float
     num_tokens: int
+    num_bits: int
+    data: bytes
+
+    def to_bytes(self) -> bytes:
+        # big-endian two unsigned 4byte ints
+        header = struct.pack(">II", self.num_tokens, self.num_bits)
+        return header + self.data
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "Compressed":
+        num_tokens, num_bits = struct.unpack(">II", data[:8])
+        return cls(num_tokens=num_tokens, num_bits=num_bits, data=data[8:])
 
 
-def compress(llm: Llama, text: str) -> Compressed:
+def bits_to_bytes(bits: List[int]) -> bytes:
+    # pad to byte width
+    padding = (8 - len(bits) % 8) % 8
+    padded_bits = bits + [0] * padding
+
+    byte_array = bytearray()
+    for i in range(0, len(padded_bits), 8):
+        byte = 0
+        for j in range(8):
+            byte = (byte << 1) | padded_bits[i + j]
+        byte_array.append(byte)
+
+    return bytes(byte_array)
+
+
+def bytes_to_bits(data: bytes, num_bits: int) -> List[int]:
+    bits = []
+    for byte in data:
+        for i in range(7, -1, -1):
+            bits.append((byte >> i) & 1)
+    return bits[:num_bits]
+
+
+def compress(
+    llm: Llama,
+    text: str,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> Compressed:
     tokens = llm.tokenize(text.encode("utf-8"))
+    total_tokens = len(tokens)
+    llm.reset()
 
-    ranks = []
-    lo, hi = 0.0, 1.0
-    intervals: List[Tuple[int, int]] = []
+    lo = 0
+    hi = MAX_RANGE
+    output_bits = []
+    underflow_count = 0
+
     for i, token in enumerate(tokens):
+        if progress_callback:
+            progress_callback(i + 1, total_tokens)
+
         probs = get_token_probs(llm, tokens[:i])
         next_tokens_sorted = np.argsort(probs)[::-1]
 
         rank = np.where(next_tokens_sorted == token)[0][0]
-        ranks.append(rank)
         prob_before = np.sum(probs[next_tokens_sorted][:rank])
         next_token_prob = probs[token]
-        print(f"rank: {rank}, prob: {next_token_prob}, prob_before: {prob_before}")
 
+        # update interval
         width = hi - lo
-        new_lo = prob_before * width + lo
-        new_hi = (prob_before + next_token_prob) * width + lo
-        lo, hi = new_lo, new_hi
-        intervals.append((lo, hi))
+        lo = lo + int(prob_before * width)
+        hi = lo + max(1, int(next_token_prob * width))
 
-    final_point = (lo + hi) / 2
+        # renormalize
+        while True:
+            if hi <= HALF:
+                output_bits.append(0)
+                output_bits.extend([1] * underflow_count)
+                underflow_count = 0
+                lo = lo << 1
+                hi = hi << 1
+            elif lo >= HALF:
+                output_bits.append(1)
+                output_bits.extend([0] * underflow_count)
+                underflow_count = 0
+                lo = (lo - HALF) << 1
+                hi = (hi - HALF) << 1
+            elif lo >= QUARTER and hi <= THREE_QUARTERS:
+                underflow_count += 1
+                lo = (lo - QUARTER) << 1
+                hi = (hi - QUARTER) << 1
+            else:
+                break
+
+    # flush remaining bits
+    underflow_count += 1
+    if lo < QUARTER:
+        output_bits.append(0)
+        output_bits.extend([1] * underflow_count)
+    else:
+        output_bits.append(1)
+        output_bits.extend([0] * underflow_count)
+
+    num_bits = len(output_bits)
+    compressed_bytes = bits_to_bytes(output_bits)
+
     return Compressed(
-        ranks=ranks,
-        intervals=intervals,
-        final_point=final_point,
         num_tokens=len(tokens),
+        num_bits=num_bits,
+        data=compressed_bytes,
     )
 
 
 def decompress(llm: Llama, compressed: Compressed) -> str:
-    lo, hi = 0.0, 1.0
+    bits = bytes_to_bits(compressed.data, compressed.num_bits)
+    llm.reset()
+
+    # read initial val from bitstream
+    value = 0
+    bit_index = 0
+    for _ in range(PRECISION):
+        value = value << 1
+        if bit_index < len(bits):
+            value |= bits[bit_index]
+            bit_index += 1
+
+    lo = 0
+    hi = MAX_RANGE
+
     decompressed_tokens = []
-    current_point = compressed.final_point
-    for i in range(compressed.num_tokens):
+    for _ in range(compressed.num_tokens):
         probs = get_token_probs(llm, decompressed_tokens)
         next_tokens_sorted = np.argsort(probs)[::-1]
+
+        width = hi - lo
+        position = (value - lo) / width
+
         cdf = np.cumsum(probs[next_tokens_sorted])
-        rank = np.searchsorted(cdf, current_point)
+        rank = np.searchsorted(cdf, position, side="right")
         token = next_tokens_sorted[rank]
         decompressed_tokens.append(token)
 
         prob_before = np.sum(probs[next_tokens_sorted][:rank])
-        next_token_prob = probs[token]
-        width = next_token_prob
-        current_point = (current_point - prob_before) / width
-        print(f"current_point = {current_point}, prob_before = {prob_before}")
+        prob_token = probs[token]
 
-        print(rank)
+        # update interval
+        lo = lo + int(prob_before * width)
+        hi = lo + max(1, int(prob_token * width))
 
-    return "".join(
-        llm.detokenize(decompressed_tokens).decode("utf-8", errors="replace")
+        # renormalize
+        while True:
+            if hi <= HALF:
+                lo = lo << 1
+                hi = hi << 1
+                value = value << 1
+                if bit_index < len(bits):
+                    value |= bits[bit_index]
+                    bit_index += 1
+            elif lo >= HALF:
+                lo = (lo - HALF) << 1
+                hi = (hi - HALF) << 1
+                value = (value - HALF) << 1
+                if bit_index < len(bits):
+                    value |= bits[bit_index]
+                    bit_index += 1
+            elif lo >= QUARTER and hi <= THREE_QUARTERS:
+                lo = (lo - QUARTER) << 1
+                hi = (hi - QUARTER) << 1
+                value = (value - QUARTER) << 1
+                if bit_index < len(bits):
+                    value |= bits[bit_index]
+                    bit_index += 1
+            else:
+                break
+
+    return llm.detokenize(decompressed_tokens).decode("utf-8", errors="replace")
+
+
+def print_progress(current: int, total: int):
+    percent = (current / total) * 100
+    bar_length = 50
+    filled = int(bar_length * current / total)
+    bar = "█" * filled + "░" * (bar_length - filled)
+    print(
+        f"\rCompressing: [{bar}] {current}/{total} tokens ({percent:.1f}%)",
+        end="",
+        flush=True,
     )
-
-
-@dataclass
-class SuperFloat:
-    exp: int
-    mantissa: int
-
-    @staticmethod
-    def from_float(f: float):
-        bits = struct.unpack(">I", struct.pack(">f", f))[0]
-
-        # Extract parts using bit operations
-        sign = (bits >> 31) & 1
-        if sign > 0:
-            raise ValueError("SuperFloats must be positive")
-
-        exp = (bits >> 23) & 0xFF  # 8 bits
-        mantissa = bits & 0x7FFFFF  # 23 bits
-
-        print(f"raw exp = {exp}, mantissa = {mantissa}")
-        exp = exp - 127
-        return SuperFloat(
-            exp=exp,
-            mantissa=mantissa,
-        )
-
-    def __mul__(self, other):
-        if not isinstance(other, SuperFloat):
-            raise TypeError("expected SuperFloat")
-        exp = self.exp + other.exp
-        mantissa = self.mantissa * other.mantissa
-        while mantissa % 2 == 0 and mantissa != 0:
-            mantissa /= 2
-            exp += 1
-
-        return SuperFloat(
-            exp=exp,
-            mantissa=mantissa,
-        )
-
-
-def test_from_float():
-    half = SuperFloat.from_float(0.5)
-    quarter = SuperFloat.from_float(0.25)
-    assert half * half == quarter
+    if current == total:
+        print()
 
 
 def main():
     llms = [
         Llama.from_pretrained(
+            repo_id="ggml-org/gpt-oss-120b-GGUF",
+            filename="gpt-oss-120b-mxfp4-00001-of-00003.gguf",
+            additional_files=[
+                "gpt-oss-120b-mxfp4-00002-of-00003.gguf",
+                "gpt-oss-120b-mxfp4-00003-of-00003.gguf",
+            ],
+            verbose=False,
+            logits_all=True,
+            n_gpu_layers=-1,
+            n_ctx=32768,
+        ),
+        Llama.from_pretrained(
             repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF",
             filename="*q8_0.gguf",
             verbose=False,
             logits_all=True,
+            n_gpu_layers=-1,
+            n_ctx=32768,
         ),
         Llama.from_pretrained(
             repo_id="QuantFactory/Meta-Llama-3-8B-GGUF",
             filename="*Q8_0.gguf",
             verbose=False,
             logits_all=True,
+            n_gpu_layers=-1,
+            n_ctx=32768,
+        ),
+        Llama.from_pretrained(
+            repo_id="QuantFactory/SmolLM2-360M-GGUF",
+            filename="*Q4_0.gguf",
+            verbose=False,
+            logits_all=True,
+            n_gpu_layers=-1,
+            n_ctx=32768,
         ),
     ]
 
     texts = [
-        "The capital of the United States is New Delhi",
+        "hello world",
+        "The capital of the United States is Washington, D.C.",
+        "tdoajpwdojaw podfjawpofjawpfojawpfojawpfojawfpoawjfpoawjfpoawjfpawofjawpofjawpofjawpofjawpofjawpofjawpofjawfpoa",
+        "".join(
+            random.choices(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=200
+            )
+        ),
+        """In information theory, data compression, source coding,[1] or bit-rate reduction is the process of encoding information using fewer bits than the original representation.[2] Any particular compression is either lossy or lossless. Lossless compression reduces bits by identifying and eliminating statistical redundancy. No information is lost in lossless compression. Lossy compression reduces bits by removing unnecessary or less important information.[3] Typically, a device that performs data compression is referred to as an encoder, and one that performs the reversal of the process (decompression) as a decoder.
+        The process of reducing the size of a data file is often referred to as data compression. In the context of data transmission, it is called source coding: encoding is done at the source of the data before it is stored or transmitted.[4] Source coding should not be confused with channel coding, for error detection and correction or line coding, the means for mapping data onto a signal.
+        Data compression algorithms present a space–time complexity trade-off between the bytes needed to store or transmit information, and the computational resources needed to perform the encoding and decoding. The design of data compression schemes involves balancing the degree of compression, the amount of distortion introduced (when using lossy data compression), and the computational resources or time required to compress and decompress the data.[5] """,
     ]
 
     for llm in llms:
+        print(f"Using model: {llm.metadata['general.name']}")
         for text in texts:
-            compressed = compress(llm, text)
-            print(compressed)
+            print(f"\nText to encode: {text}")
+            original_bytes = text.encode("utf-8")
+            original_size = len(original_bytes)
+
+            # LLM compression
+            compressed = compress(llm, text, progress_callback=print_progress)
+            compressed_size = len(compressed.to_bytes())
+            compression_ratio = original_size / compressed_size
+
+            # Common compression algorithms
+            gzip_size = len(zlib.compress(original_bytes, level=9))
+            bz2_size = len(bz2.compress(original_bytes, compresslevel=9))
+            lzma_size = len(lzma.compress(original_bytes, preset=9))
+            zstd_size = len(zstd.compress(original_bytes, 22))
+
+            print(f"Encoded: {base64.b64encode(compressed.to_bytes()).decode('ascii')}")
+            print("\nCompression Results:")
+            print(f"  Original:        {original_size:>6} bytes")
+            print(
+                f"  LLM compressed:  {compressed_size:>6} bytes ({compression_ratio:.2f}x)"
+            )
+            print(
+                f"  ZSTD (level 22):  {zstd_size:>6} bytes ({original_size / zstd_size:.2f}x)"
+            )
+            print(
+                f"  GZIP (level 9):  {gzip_size:>6} bytes ({original_size / gzip_size:.2f}x)"
+            )
+            print(
+                f"  BZ2 (level 9):   {bz2_size:>6} bytes ({original_size / bz2_size:.2f}x)"
+            )
+            print(
+                f"  LZMA (level 9):  {lzma_size:>6} bytes ({original_size / lzma_size:.2f}x)"
+            )
+
             decompressed = decompress(llm, compressed)
-            print(decompressed)
+            print(f"\nDecompressed correctly? {decompressed == text}")
             assert decompressed == text
 
 
