@@ -50,18 +50,14 @@ def get_token_probs(llm: Llama, context_tokens: List[int]):
 
 @dataclass
 class Compressed:
-    num_tokens: int
     data: bytes
 
     def to_bytes(self) -> bytes:
-        # big-endian unsigned 4byte int
-        header = struct.pack(">I", self.num_tokens)
-        return header + self.data
+        return self.data
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "Compressed":
-        num_tokens = struct.unpack(">I", data[:4])[0]
-        return cls(num_tokens=num_tokens, data=data[4:])
+        return cls(data=data)
 
 
 def bits_to_bytes(bits: List[int]) -> bytes:
@@ -93,6 +89,7 @@ def compress(
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Compressed:
     tokens = llm.tokenize(text.encode("utf-8"))
+    tokens.append(llm.token_eos())  # Add EOS marker
     total_tokens = len(tokens)
     llm.reset()
 
@@ -149,10 +146,7 @@ def compress(
 
     compressed_bytes = bits_to_bytes(output_bits)
 
-    return Compressed(
-        num_tokens=len(tokens),
-        data=compressed_bytes,
-    )
+    return Compressed(data=compressed_bytes)
 
 
 def decompress(llm: Llama, compressed: Compressed) -> str:
@@ -172,7 +166,9 @@ def decompress(llm: Llama, compressed: Compressed) -> str:
     hi = MAX_RANGE
 
     decompressed_tokens = []
-    for _ in range(compressed.num_tokens):
+    eos_token = llm.token_eos()
+
+    while True:
         probs = get_token_probs(llm, decompressed_tokens)
         next_tokens_sorted = np.argsort(probs)[::-1]
 
@@ -182,6 +178,11 @@ def decompress(llm: Llama, compressed: Compressed) -> str:
         cdf = np.cumsum(probs[next_tokens_sorted])
         rank = np.searchsorted(cdf, position, side="right")
         token = next_tokens_sorted[rank]
+
+        # Stop if we hit EOS token
+        if token == eos_token:
+            break
+
         decompressed_tokens.append(token)
 
         prob_before = np.sum(probs[next_tokens_sorted][:rank])
