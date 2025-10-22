@@ -51,18 +51,17 @@ def get_token_probs(llm: Llama, context_tokens: List[int]):
 @dataclass
 class Compressed:
     num_tokens: int
-    num_bits: int
     data: bytes
 
     def to_bytes(self) -> bytes:
-        # big-endian two unsigned 4byte ints
-        header = struct.pack(">II", self.num_tokens, self.num_bits)
+        # big-endian unsigned 4byte int
+        header = struct.pack(">I", self.num_tokens)
         return header + self.data
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "Compressed":
-        num_tokens, num_bits = struct.unpack(">II", data[:8])
-        return cls(num_tokens=num_tokens, num_bits=num_bits, data=data[8:])
+        num_tokens = struct.unpack(">I", data[:4])[0]
+        return cls(num_tokens=num_tokens, data=data[4:])
 
 
 def bits_to_bytes(bits: List[int]) -> bytes:
@@ -80,12 +79,12 @@ def bits_to_bytes(bits: List[int]) -> bytes:
     return bytes(byte_array)
 
 
-def bytes_to_bits(data: bytes, num_bits: int) -> List[int]:
+def bytes_to_bits(data: bytes) -> List[int]:
     bits = []
     for byte in data:
         for i in range(7, -1, -1):
             bits.append((byte >> i) & 1)
-    return bits[:num_bits]
+    return bits
 
 
 def compress(
@@ -148,18 +147,16 @@ def compress(
         output_bits.append(1)
         output_bits.extend([0] * underflow_count)
 
-    num_bits = len(output_bits)
     compressed_bytes = bits_to_bytes(output_bits)
 
     return Compressed(
         num_tokens=len(tokens),
-        num_bits=num_bits,
         data=compressed_bytes,
     )
 
 
 def decompress(llm: Llama, compressed: Compressed) -> str:
-    bits = bytes_to_bits(compressed.data, compressed.num_bits)
+    bits = bytes_to_bits(compressed.data)
     llm.reset()
 
     # read initial val from bitstream
