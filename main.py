@@ -4,24 +4,26 @@ import bz2
 import lzma
 import base64
 import struct
+import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from llama_cpp import Llama
+from numpy.typing import NDArray
 import numpy as np
 import zstd
 
 
 PRECISION = 32  # use 32bit presision b/c it fits in 64 (so overflow is easy to detect) & math is easier
-MAX_RANGE = 1 << PRECISION
-HALF = 1 << (PRECISION - 1)
-QUARTER = 1 << (PRECISION - 2)
-THREE_QUARTERS = 3 * QUARTER
+MAX_RANGE = 1 << PRECISION  # 2^32
+HALF = 1 << (PRECISION - 1)  # 2^31
+QUARTER = 1 << (PRECISION - 2)  # 2^30
+THREE_QUARTERS = 3 * QUARTER  # 3 * 2^30
 
 WINDOW_SIZE = 64  # this is the max number of tokens we will send to the LLM before resetting the context
 
 
-def get_token_probs(llm: Llama, context_tokens: List[int]):
+def get_token_probs(llm: Llama, context_tokens: List[int]) -> NDArray[np.float64]:
     """Get probability distribution for next token given context"""
     if len(context_tokens) == 0:
         # Empty context - use BOS token or evaluate empty
@@ -96,8 +98,8 @@ def compress(
     total_tokens = len(tokens)
     llm.reset()
 
-    lo = 0
-    hi = MAX_RANGE
+    lo = np.uint64(0)
+    hi = np.uint64(MAX_RANGE)
     output_bits = []
     underflow_count = 0
 
@@ -114,8 +116,8 @@ def compress(
 
         # update interval
         width = hi - lo
-        lo = lo + int(prob_before * width)
-        hi = lo + max(1, int(next_token_prob * width))
+        lo = lo + np.uint64(prob_before * width)
+        hi = lo + max(np.uint64(1), np.uint64(next_token_prob * width))
 
         # renormalize
         while True:
@@ -164,16 +166,16 @@ def decompress(
     llm.reset()
 
     # read initial val from bitstream
-    value = 0
+    value = np.uint64(0)
     bit_index = 0
     for _ in range(PRECISION):
         value = value << 1
         if bit_index < len(bits):
-            value |= bits[bit_index]
+            value = value | bits[bit_index]
             bit_index += 1
 
-    lo = 0
-    hi = MAX_RANGE
+    lo = np.uint64(0)
+    hi = np.uint64(MAX_RANGE)
 
     decompressed_tokens = []
     for i in range(compressed.num_tokens):
@@ -185,6 +187,18 @@ def decompress(
         width = hi - lo
         position = (value - lo) / width
 
+        # Clamp position to valid range [0, 1) to prevent out-of-bounds
+        if position < 0:
+            print(
+                f"\nWARNING: position < 0 at token {i}: {position}, value={value}, lo={lo}, hi={hi}"
+            )
+            position = 0
+        elif position >= 1.0:
+            print(
+                f"\nWARNING: position >= 1.0 at token {i}: {position}, value={value}, lo={lo}, hi={hi}"
+            )
+            position = 0.9999999
+
         cdf = np.cumsum(probs[next_tokens_sorted])
         rank = np.searchsorted(cdf, position, side="right")
         token = next_tokens_sorted[rank]
@@ -194,8 +208,8 @@ def decompress(
         prob_token = probs[token]
 
         # update interval
-        lo = lo + int(prob_before * width)
-        hi = lo + max(1, int(prob_token * width))
+        lo = lo + np.uint64(prob_before * width)
+        hi = lo + max(np.uint64(1), np.uint64(prob_token * width))
 
         # renormalize
         while True:
@@ -204,26 +218,34 @@ def decompress(
                 hi = hi << 1
                 value = value << 1
                 if bit_index < len(bits):
-                    value |= bits[bit_index]
+                    value = value | bits[bit_index]
                     bit_index += 1
             elif lo >= HALF:
                 lo = (lo - HALF) << 1
                 hi = (hi - HALF) << 1
                 value = (value - HALF) << 1
                 if bit_index < len(bits):
-                    value |= bits[bit_index]
+                    value = value | bits[bit_index]
                     bit_index += 1
             elif lo >= QUARTER and hi <= THREE_QUARTERS:
                 lo = (lo - QUARTER) << 1
                 hi = (hi - QUARTER) << 1
                 value = (value - QUARTER) << 1
                 if bit_index < len(bits):
-                    value |= bits[bit_index]
+                    value = value | bits[bit_index]
                     bit_index += 1
             else:
                 break
 
     return llm.detokenize(decompressed_tokens).decode("utf-8", errors="replace")
+
+
+def decompress_b64(llm: Llama, input: str):
+    bytes = base64.b64decode(input)
+    compressed = Compressed.from_bytes(bytes)
+    out = decompress(llm, compressed)
+    print("Decoded Text:")
+    print(out)
 
 
 def print_progress(current: int, total: int, operation: str = "Compressing"):
@@ -240,44 +262,92 @@ def print_progress(current: int, total: int, operation: str = "Compressing"):
         print()
 
 
+def compress_and_compare(
+    llm: Llama,
+    input: str,
+):
+    print("Compressing the following input:\n")
+    print(input)
+
+    start = time.time()
+    compressed = compress(llm, input)
+    end = time.time()
+    print(f"\nCompressed in {end - start:.2f} seconds.\n")
+    # compare results
+    original_bytes = input.encode("utf-8")
+    original_size = len(original_bytes)
+
+    # calc llm compression ratio
+    compressed_size = len(compressed.to_bytes())
+    compression_ratio = original_size / compressed_size
+
+    # calc compression algorithms
+    gzip_size = len(zlib.compress(original_bytes, level=9))
+    bz2_size = len(bz2.compress(original_bytes, compresslevel=9))
+    lzma_size = len(lzma.compress(original_bytes, preset=9))
+    zstd_size = len(zstd.compress(original_bytes, 22))
+
+    print(f"Encoded: {base64.b64encode(compressed.to_bytes()).decode('ascii')}")
+    print("\nCompression Results:")
+    print(f"  Original:        {original_size:>6} bytes")
+    print(f"  LLM compressed:  {compressed_size:>6} bytes ({compression_ratio:.2f}x)")
+    print(
+        f"  ZSTD (level 22):  {zstd_size:>6} bytes ({original_size / zstd_size:.2f}x)"
+    )
+    print(f"  GZIP (level 9):  {gzip_size:>6} bytes ({original_size / gzip_size:.2f}x)")
+    print(f"  BZ2 (level 9):   {bz2_size:>6} bytes ({original_size / bz2_size:.2f}x)")
+    print(f"  LZMA (level 9):  {lzma_size:>6} bytes ({original_size / lzma_size:.2f}x)")
+
+    print("Decompressing...")
+    to_decompress = Compressed.from_bytes(compressed.to_bytes())
+
+    start = time.time()
+    decompressed = decompress(llm, to_decompress)
+    end = time.time()
+    print(f"\nDecompressed in {end - start:.2f} seconds.\n")
+
+    assert decompressed == input, "Decompression failed!"
+    print("\nDecompression successful!")
+
+
 def main():
     llms = [
-        Llama.from_pretrained(
-            repo_id="ggml-org/gpt-oss-120b-GGUF",
-            filename="gpt-oss-120b-mxfp4-00001-of-00003.gguf",
-            additional_files=[
-                "gpt-oss-120b-mxfp4-00002-of-00003.gguf",
-                "gpt-oss-120b-mxfp4-00003-of-00003.gguf",
-            ],
-            verbose=False,
-            logits_all=True,
-            n_gpu_layers=-1,
-            n_ctx=32768,
-        ),
-        Llama.from_pretrained(
-            repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF",
-            filename="*q8_0.gguf",
-            verbose=False,
-            logits_all=True,
-            n_gpu_layers=-1,
-            n_ctx=32768,
-        ),
+        # Llama.from_pretrained(
+        #     repo_id="ggml-org/gpt-oss-120b-GGUF",
+        #     filename="gpt-oss-120b-mxfp4-00001-of-00003.gguf",
+        #     additional_files=[
+        #         "gpt-oss-120b-mxfp4-00002-of-00003.gguf",
+        #         "gpt-oss-120b-mxfp4-00003-of-00003.gguf",
+        #     ],
+        #     verbose=False,
+        #     logits_all=True,
+        #     n_gpu_layers=-1,
+        #     n_ctx=32768,
+        # ),
+        # Llama.from_pretrained(
+        #     repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF",
+        #     filename="*q8_0.gguf",
+        #     verbose=False,
+        #     logits_all=True,
+        #     n_gpu_layers=-1,
+        #     n_ctx=32768,
+        # ),
         Llama.from_pretrained(
             repo_id="QuantFactory/Meta-Llama-3-8B-GGUF",
             filename="*Q8_0.gguf",
             verbose=False,
-            logits_all=True,
+            # logits_all=True,
             n_gpu_layers=-1,
             n_ctx=32768,
         ),
-        Llama.from_pretrained(
-            repo_id="QuantFactory/SmolLM2-360M-GGUF",
-            filename="*Q4_0.gguf",
-            verbose=False,
-            logits_all=True,
-            n_gpu_layers=-1,
-            n_ctx=32768,
-        ),
+        # Llama.from_pretrained(
+        #     repo_id="QuantFactory/SmolLM2-360M-GGUF",
+        #     filename="*Q4_0.gguf",
+        #     verbose=False,
+        #     logits_all=True,
+        #     n_gpu_layers=-1,
+        #     n_ctx=32768,
+        # ),
     ]
 
     texts = [
@@ -332,9 +402,24 @@ def main():
             )
 
             decompressed = decompress(
-                llm, compressed, progress_callback=lambda c, t: print_progress(c, t, "Decompressing")
+                llm,
+                compressed,
+                progress_callback=lambda c, t: print_progress(c, t, "Decompressing"),
             )
-            print(f"Decompressed correctly? {decompressed == text}")
+            matches = decompressed == text
+            print(f"Decompressed correctly? {matches}")
+            if not matches:
+                print(f"\nOriginal length: {len(text)}")
+                print(f"Decompressed length: {len(decompressed)}")
+                # Find first difference
+                for i, (c1, c2) in enumerate(zip(text, decompressed)):
+                    if c1 != c2:
+                        print(f"First difference at position {i}:")
+                        print(f"  Expected: {repr(text[max(0, i - 20) : i + 20])}")
+                        print(
+                            f"  Got:      {repr(decompressed[max(0, i - 20) : i + 20])}"
+                        )
+                        break
             assert decompressed == text
 
 
