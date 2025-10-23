@@ -155,7 +155,11 @@ def compress(
     )
 
 
-def decompress(llm: Llama, compressed: Compressed) -> str:
+def decompress(
+    llm: Llama,
+    compressed: Compressed,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> str:
     bits = bytes_to_bits(compressed.data)
     llm.reset()
 
@@ -172,7 +176,9 @@ def decompress(llm: Llama, compressed: Compressed) -> str:
     hi = MAX_RANGE
 
     decompressed_tokens = []
-    for _ in range(compressed.num_tokens):
+    for i in range(compressed.num_tokens):
+        if progress_callback:
+            progress_callback(i + 1, compressed.num_tokens)
         probs = get_token_probs(llm, decompressed_tokens)
         next_tokens_sorted = np.argsort(probs)[::-1]
 
@@ -220,13 +226,13 @@ def decompress(llm: Llama, compressed: Compressed) -> str:
     return llm.detokenize(decompressed_tokens).decode("utf-8", errors="replace")
 
 
-def print_progress(current: int, total: int):
+def print_progress(current: int, total: int, operation: str = "Compressing"):
     percent = (current / total) * 100
     bar_length = 50
     filled = int(bar_length * current / total)
     bar = "█" * filled + "░" * (bar_length - filled)
     print(
-        f"\rCompressing: [{bar}] {current}/{total} tokens ({percent:.1f}%)",
+        f"\r{operation}: [{bar}] {current}/{total} tokens ({percent:.1f}%)",
         end="",
         flush=True,
     )
@@ -275,14 +281,14 @@ def main():
     ]
 
     texts = [
-        "hello world",
-        "The capital of the United States is Washington, D.C.",
-        "tdoajpwdojaw podfjawpofjawpfojawpfojawpfojawfpoawjfpoawjfpoawjfpawofjawpofjawpofjawpofjawpofjawpofjawpofjawfpoa",
-        "".join(
-            random.choices(
-                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=200
-            )
-        ),
+        # "hello world",
+        # "The capital of the United States is Washington, D.C.",
+        # "tdoajpwdojaw podfjawpofjawpfojawpfojawpfojawfpoawjfpoawjfpoawjfpawofjawpofjawpofjawpofjawpofjawpofjawpofjawfpoa",
+        # "".join(
+        #     random.choices(
+        #         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=200
+        #     )
+        # ),
         """In information theory, data compression, source coding,[1] or bit-rate reduction is the process of encoding information using fewer bits than the original representation.[2] Any particular compression is either lossy or lossless. Lossless compression reduces bits by identifying and eliminating statistical redundancy. No information is lost in lossless compression. Lossy compression reduces bits by removing unnecessary or less important information.[3] Typically, a device that performs data compression is referred to as an encoder, and one that performs the reversal of the process (decompression) as a decoder.
         The process of reducing the size of a data file is often referred to as data compression. In the context of data transmission, it is called source coding: encoding is done at the source of the data before it is stored or transmitted.[4] Source coding should not be confused with channel coding, for error detection and correction or line coding, the means for mapping data onto a signal.
         Data compression algorithms present a space–time complexity trade-off between the bytes needed to store or transmit information, and the computational resources needed to perform the encoding and decoding. The design of data compression schemes involves balancing the degree of compression, the amount of distortion introduced (when using lossy data compression), and the computational resources or time required to compress and decompress the data.[5] """,
@@ -325,8 +331,10 @@ def main():
                 f"  LZMA (level 9):  {lzma_size:>6} bytes ({original_size / lzma_size:.2f}x)"
             )
 
-            decompressed = decompress(llm, compressed)
-            print(f"\nDecompressed correctly? {decompressed == text}")
+            decompressed = decompress(
+                llm, compressed, progress_callback=lambda c, t: print_progress(c, t, "Decompressing")
+            )
+            print(f"Decompressed correctly? {decompressed == text}")
             assert decompressed == text
 
 
