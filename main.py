@@ -109,10 +109,8 @@ def compress(
             progress_callback(i + 1, total_tokens)
 
         probs = get_token_probs(llm, tokens[:i])
-        next_tokens_sorted = np.argsort(probs)[::-1]
 
-        rank = np.where(next_tokens_sorted == token)[0][0]
-        prob_before = np.sum(probs[next_tokens_sorted][:rank])
+        prob_before = np.sum(probs[:token])
         next_token_prob = probs[token]
 
         # update interval
@@ -183,7 +181,6 @@ def decompress(
         if progress_callback:
             progress_callback(i + 1, compressed.num_tokens)
         probs = get_token_probs(llm, decompressed_tokens)
-        next_tokens_sorted = np.argsort(probs)[::-1]
 
         width = hi - lo
         position = (value - lo) / width
@@ -200,12 +197,11 @@ def decompress(
             )
             position = 0.9999999
 
-        cdf = np.cumsum(probs[next_tokens_sorted])
-        rank = np.searchsorted(cdf, position, side="right")
-        token = next_tokens_sorted[rank]
+        cdf = np.cumsum(probs)
+        token = np.searchsorted(cdf, position, side="right")
         decompressed_tokens.append(token)
 
-        prob_before = np.sum(probs[next_tokens_sorted][:rank])
+        prob_before = np.sum(probs[:token])
         prob_token = probs[token]
 
         # update interval
@@ -373,7 +369,7 @@ def main():
             original_size = len(original_bytes)
 
             # LLM compression
-            compressed = compress(llm, text, progress_callback=print_progress)
+            compressed = compress(llm, text)  # , progress_callback=print_progress)
             compressed_size = len(compressed.to_bytes())
             compression_ratio = original_size / compressed_size
 
@@ -405,7 +401,7 @@ def main():
             decompressed = decompress(
                 llm,
                 compressed,
-                progress_callback=lambda c, t: print_progress(c, t, "Decompressing"),
+                # progress_callback=lambda c, t: print_progress(c, t, "Decompressing"),
             )
             matches = decompressed == text
             print(f"Decompressed correctly? {matches}")
