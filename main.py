@@ -319,7 +319,7 @@ def main():
         #     verbose=False,
         #     logits_all=False,
         #     n_gpu_layers=-1,
-        #     n_ctx=32768,
+        #     n_ctx=WINDOW_SIZE * 2,
         # ),
         # Llama.from_pretrained(
         #     repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF",
@@ -327,7 +327,7 @@ def main():
         #     verbose=False,
         #     logits_all=False,
         #     n_gpu_layers=-1,
-        #     n_ctx=32768,
+        #     n_ctx=WINDOW_SIZE * 2,
         # ),
         # Llama.from_pretrained(
         #     repo_id="QuantFactory/Meta-Llama-3-8B-GGUF",
@@ -335,7 +335,7 @@ def main():
         #     verbose=False,
         #     logits_all=False,
         #     n_gpu_layers=-1,
-        #     n_ctx=32768,
+        #     n_ctx=WINDOW_SIZE * 2,
         # ),
         Llama.from_pretrained(
             repo_id="QuantFactory/SmolLM2-360M-GGUF",
@@ -343,19 +343,19 @@ def main():
             verbose=False,
             logits_all=False,
             n_gpu_layers=-1,
-            n_ctx=32768,
+            n_ctx=WINDOW_SIZE * 2,
         ),
     ]
 
     texts = [
-        # "hello world",
-        # "The capital of the United States is Washington, D.C.",
-        # "tdoajpwdojaw podfjawpofjawpfojawpfojawpfojawfpoawjfpoawjfpoawjfpawofjawpofjawpofjawpofjawpofjawpofjawpofjawfpoa",
-        # "".join(
-        #     random.choices(
-        #         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=200
-        #     )
-        # ),
+        "hello world",
+        "The capital of the United States is Washington, D.C.",
+        "tdoajpwdojaw podfjawpofjawpfojawpfojawpfojawfpoawjfpoawjfpoawjfpawofjawpofjawpofjawpofjawpofjawpofjawpofjawfpoa",
+        "".join(
+            random.choices(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=200
+            )
+        ),
         """In information theory, data compression, source coding,[1] or bit-rate reduction is the process of encoding information using fewer bits than the original representation.[2] Any particular compression is either lossy or lossless. Lossless compression reduces bits by identifying and eliminating statistical redundancy. No information is lost in lossless compression. Lossy compression reduces bits by removing unnecessary or less important information.[3] Typically, a device that performs data compression is referred to as an encoder, and one that performs the reversal of the process (decompression) as a decoder.
         The process of reducing the size of a data file is often referred to as data compression. In the context of data transmission, it is called source coding: encoding is done at the source of the data before it is stored or transmitted.[4] Source coding should not be confused with channel coding, for error detection and correction or line coding, the means for mapping data onto a signal.
         Data compression algorithms present a space–time complexity trade-off between the bytes needed to store or transmit information, and the computational resources needed to perform the encoding and decoding. The design of data compression schemes involves balancing the degree of compression, the amount of distortion introduced (when using lossy data compression), and the computational resources or time required to compress and decompress the data.[5] """,
@@ -369,7 +369,9 @@ def main():
             original_size = len(original_bytes)
 
             # LLM compression
+            start = time.time()
             compressed = compress(llm, text)  # , progress_callback=print_progress)
+            end = time.time()
             compressed_size = len(compressed.to_bytes())
             compression_ratio = original_size / compressed_size
 
@@ -381,6 +383,7 @@ def main():
 
             print(f"Encoded: {base64.b64encode(compressed.to_bytes()).decode('ascii')}")
             print("\nCompression Results:")
+            print(f"Compressed in {end - start:.2f} seconds")
             print(f"  Original:        {original_size:>6} bytes")
             print(
                 f"  LLM compressed:  {compressed_size:>6} bytes ({compression_ratio:.2f}x)"
@@ -398,16 +401,19 @@ def main():
                 f"  LZMA (level 9):  {lzma_size:>6} bytes ({original_size / lzma_size:.2f}x)"
             )
 
+            start = time.time()
             decompressed = decompress(
                 llm,
                 compressed,
                 # progress_callback=lambda c, t: print_progress(c, t, "Decompressing"),
             )
+            end = time.time()
             matches = decompressed == text
             print(f"Decompressed correctly? {matches}")
             if not matches:
                 print(f"\nOriginal length: {len(text)}")
                 print(f"Decompressed length: {len(decompressed)}")
+                print(f"Decompressed in {end - start:.2f} seconds")
                 # Find first difference
                 for i, (c1, c2) in enumerate(zip(text, decompressed)):
                     if c1 != c2:
