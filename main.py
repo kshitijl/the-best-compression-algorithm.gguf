@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-from llama_cpp import Llama
+from llama_cpp import Llama, llama_get_logits
 from numpy.typing import NDArray
 import numpy as np
 import zstd
@@ -37,16 +37,17 @@ def get_token_probs(llm: Llama, context_tokens: List[int]) -> NDArray[np.float64
     llm.eval([context_tokens[-1]])
 
     # Get logits for the last position
-    logits = llm.eval_logits[-1]  # Shape: (vocab_size,)
-
+    logits_ptr = llama_get_logits(llm.ctx)
+    logits_np = np.ctypeslib.as_array(logits_ptr, shape=(llm.n_vocab(),))
     # Convert to probabilities with softmax
-    logits_np = np.array(logits, dtype=np.float64)
+    logits_np = np.array(
+        logits_np, dtype=np.float64
+    )  # TODO figure out why we need this extra precision
 
     # Numerically stable softmax
     logits_np = logits_np - np.max(logits_np)  # Prevent overflow
     exp_logits = np.exp(logits_np)
     probs = exp_logits / np.sum(exp_logits)
-
     return probs
 
 
@@ -320,7 +321,7 @@ def main():
         #         "gpt-oss-120b-mxfp4-00003-of-00003.gguf",
         #     ],
         #     verbose=False,
-        #     logits_all=True,
+        #     logits_all=False,
         #     n_gpu_layers=-1,
         #     n_ctx=32768,
         # ),
@@ -328,26 +329,26 @@ def main():
         #     repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF",
         #     filename="*q8_0.gguf",
         #     verbose=False,
-        #     logits_all=True,
+        #     logits_all=False,
+        #     n_gpu_layers=-1,
+        #     n_ctx=32768,
+        # ),
+        # Llama.from_pretrained(
+        #     repo_id="QuantFactory/Meta-Llama-3-8B-GGUF",
+        #     filename="*Q8_0.gguf",
+        #     verbose=False,
+        #     logits_all=False,
         #     n_gpu_layers=-1,
         #     n_ctx=32768,
         # ),
         Llama.from_pretrained(
-            repo_id="QuantFactory/Meta-Llama-3-8B-GGUF",
-            filename="*Q8_0.gguf",
+            repo_id="QuantFactory/SmolLM2-360M-GGUF",
+            filename="*Q4_0.gguf",
             verbose=False,
-            # logits_all=True,
+            logits_all=False,
             n_gpu_layers=-1,
             n_ctx=32768,
         ),
-        # Llama.from_pretrained(
-        #     repo_id="QuantFactory/SmolLM2-360M-GGUF",
-        #     filename="*Q4_0.gguf",
-        #     verbose=False,
-        #     logits_all=True,
-        #     n_gpu_layers=-1,
-        #     n_ctx=32768,
-        # ),
     ]
 
     texts = [
