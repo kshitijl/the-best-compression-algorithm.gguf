@@ -1,3 +1,4 @@
+import os
 import random
 import zlib
 import bz2
@@ -18,7 +19,7 @@ PRECISION = 64  # use 32bit presision b/c it fits in 64 (so overflow is easy to 
 MAX_RANGE = np.uint64(0xFFFFFFFFFFFFFFFF)
 hi_order_bit_mask = 0x8000000000000000
 
-WINDOW_SIZE = 64  # this is the max number of tokens we will send to the LLM before resetting the context
+WINDOW_SIZE = 2048  # this is the max number of tokens we will send to the LLM before resetting the context
 
 
 def get_token_probs(llm: Llama, context_tokens: List[int]) -> NDArray[np.float64]:
@@ -103,7 +104,7 @@ def compress(
 
     for i, token in enumerate(tokens):
         token_str = llm.detokenize([token]).decode("utf-8", errors="replace")
-        print(f"token: {token_str}")
+        # print(f"token: {token_str}")
         if progress_callback:
             progress_callback(i + 1, total_tokens)
 
@@ -116,12 +117,12 @@ def compress(
         assert (lo & hi_order_bit_mask) != (hi & hi)
 
         # update interval
-        print(f"before update: lo: {lo}, hi: {hi}")
+        # print(f"before update: lo: {lo}, hi: {hi}")
         width = hi - lo
         lo = lo + np.uint64(prob_before * width)
         hi = lo + np.uint64(next_token_prob * width)
-        print(f"after update: lo: {lo}, hi: {hi}")
-        print(f"next_token_prob: {next_token_prob}")
+        # print(f"after update: lo: {lo}, hi: {hi}")
+        # print(f"next_token_prob: {next_token_prob}")
         assert lo != hi
         assert hi > lo
 
@@ -130,7 +131,7 @@ def compress(
             lo = lo << 1
             hi = hi << 1
 
-        print(f"after renormalize: lo: {lo}, hi: {hi}")
+        # print(f"after renormalize: lo: {lo}, hi: {hi}")
 
         assert hi > lo
         assert (lo & hi_order_bit_mask) != (hi & hi_order_bit_mask)
@@ -204,20 +205,20 @@ def decompress(
         prob_before = np.sum(probs[:token])
         prob_token = probs[token]
 
-        token_str = llm.detokenize([token]).decode("utf-8", errors="replace")
-        print(f"token: {token_str}")
-        if i == compressed.num_tokens - 1:
-            print(
-                llm.detokenize(
-                    [token - 2, token - 1, token, token + 1, token + 2]
-                ).decode("utf-8", errors="replace")
-            )
+        # token_str = llm.detokenize([token]).decode("utf-8", errors="replace")
+        # print(f"token: {token_str}")
+        # if i == compressed.num_tokens - 1:
+        #     print(
+        #         llm.detokenize(
+        #             [token - 2, token - 1, token, token + 1, token + 2]
+        #         ).decode("utf-8", errors="replace")
+        #     )
         # update interval
-        print(f"before update: lo: {lo}, hi: {hi}")
+        # print(f"before update: lo: {lo}, hi: {hi}")
         lo = lo + np.uint64(prob_before * width)
         hi = lo + np.uint64(prob_token * width)
-        print(f"after update: lo: {lo}, hi: {hi}")
-        print(f"next_token_prob: {prob_token}")
+        # print(f"after update: lo: {lo}, hi: {hi}")
+        # print(f"next_token_prob: {prob_token}")
 
         while (lo & hi_order_bit_mask) == (hi & hi_order_bit_mask):
             lo = lo << 1
@@ -227,7 +228,7 @@ def decompress(
                 current_window = current_window | bits[bit_index]
                 bit_index += 1
 
-        print(f"after renormalize: lo: {lo}, hi: {hi}")
+        # print(f"after renormalize: lo: {lo}, hi: {hi}")
 
     return llm.detokenize(decompressed_tokens).decode("utf-8", errors="replace")
 
@@ -304,18 +305,18 @@ def compress_and_compare(
 
 def main():
     llms = [
-        # Llama.from_pretrained(
-        #     repo_id="ggml-org/gpt-oss-120b-GGUF",
-        #     filename="gpt-oss-120b-mxfp4-00001-of-00003.gguf",
-        #     additional_files=[
-        #         "gpt-oss-120b-mxfp4-00002-of-00003.gguf",
-        #         "gpt-oss-120b-mxfp4-00003-of-00003.gguf",
-        #     ],
-        #     verbose=False,
-        #     logits_all=False,
-        #     n_gpu_layers=-1,
-        #     n_ctx=WINDOW_SIZE * 2,
-        # ),
+        Llama.from_pretrained(
+            repo_id="ggml-org/gpt-oss-120b-GGUF",
+            filename="gpt-oss-120b-mxfp4-00001-of-00003.gguf",
+            additional_files=[
+                "gpt-oss-120b-mxfp4-00002-of-00003.gguf",
+                "gpt-oss-120b-mxfp4-00003-of-00003.gguf",
+            ],
+            verbose=False,
+            logits_all=False,
+            n_gpu_layers=-1,
+            n_ctx=WINDOW_SIZE * 2,
+        ),
         # Llama.from_pretrained(
         #     repo_id="Qwen/Qwen2-0.5B-Instruct-GGUF",
         #     filename="*q8_0.gguf",
@@ -332,15 +333,18 @@ def main():
         #     n_gpu_layers=-1,
         #     n_ctx=WINDOW_SIZE * 2,
         # ),
-        Llama.from_pretrained(
-            repo_id="QuantFactory/SmolLM2-360M-GGUF",
-            filename="*Q4_0.gguf",
-            verbose=False,
-            logits_all=False,
-            n_gpu_layers=-1,
-            n_ctx=WINDOW_SIZE * 2,
-        ),
+        # Llama.from_pretrained(
+        #     repo_id="QuantFactory/SmolLM2-360M-GGUF",
+        #     filename="*Q4_0.gguf",
+        #     verbose=False,
+        #     logits_all=False,
+        #     n_gpu_layers=-1,
+        #     n_ctx=WINDOW_SIZE * 2,
+        # ),
     ]
+
+    with open(__file__) as file:
+        content = file.read()
 
     texts = [
         # "hello world",
@@ -367,74 +371,16 @@ def main():
         #   // we use a transparent background.
         #   # 'background: #e6e6e6;' +
         # """,
-        """In information theory, data compression, source coding,[1] or bit-rate reduction is the process of encoding information using fewer bits than the original representation.[2] Any particular compression is either lossy or lossless. Lossless compression reduces bits by identifying and eliminating statistical redundancy. No information is lost in lossless compression. Lossy compression reduces bits by removing unnecessary or less important information.[3] Typically, a device that performs data compression is referred to as an encoder, and one that performs the reversal of the process (decompression) as a decoder.
-        The process of reducing the size of a data file is often referred to as data compression. In the context of data transmission, it is called source coding: encoding is done at the source of the data before it is stored or transmitted.[4] Source coding should not be confused with channel coding, for error detection and correction or line coding, the means for mapping data onto a signal.
-        Data compression algorithms present a space–time complexity trade-off between the bytes needed to store or transmit information, and the computational resources needed to perform the encoding and decoding. The design of data compression schemes involves balancing the degree of compression, the amount of distortion introduced (when using lossy data compression), and the computational resources or time required to compress and decompress the data.[5] """,
+        # """In information theory, data compression, source coding,[1] or bit-rate reduction is the process of encoding information using fewer bits than the original representation.[2] Any particular compression is either lossy or lossless. Lossless compression reduces bits by identifying and eliminating statistical redundancy. No information is lost in lossless compression. Lossy compression reduces bits by removing unnecessary or less important information.[3] Typically, a device that performs data compression is referred to as an encoder, and one that performs the reversal of the process (decompression) as a decoder.
+        # The process of reducing the size of a data file is often referred to as data compression. In the context of data transmission, it is called source coding: encoding is done at the source of the data before it is stored or transmitted.[4] Source coding should not be confused with channel coding, for error detection and correction or line coding, the means for mapping data onto a signal.
+        # Data compression algorithms present a space–time complexity trade-off between the bytes needed to store or transmit information, and the computational resources needed to perform the encoding and decoding. The design of data compression schemes involves balancing the degree of compression, the amount of distortion introduced (when using lossy data compression), and the computational resources or time required to compress and decompress the data.[5] """,
+        content
     ]
 
     for llm in llms:
         print(f"Using model: {llm.metadata['general.name']}")
         for text in texts:
-            print(f"\nText to encode: {text}")
-            original_bytes = text.encode("utf-8")
-            original_size = len(original_bytes)
-
-            # LLM compression
-            start = time.time()
-            compressed = compress(llm, text)  # , progress_callback=print_progress)
-            end = time.time()
-            compressed_size = len(compressed.to_bytes())
-            compression_ratio = original_size / compressed_size
-
-            # Common compression algorithms
-            gzip_size = len(zlib.compress(original_bytes, level=9))
-            bz2_size = len(bz2.compress(original_bytes, compresslevel=9))
-            lzma_size = len(lzma.compress(original_bytes, preset=9))
-            zstd_size = len(zstd.compress(original_bytes, 22))
-
-            print(f"Encoded: {base64.b64encode(compressed.to_bytes()).decode('ascii')}")
-            print("\nCompression Results:")
-            print(f"Compressed in {end - start:.2f} seconds")
-            print(f"  Original:        {original_size:>6} bytes")
-            print(
-                f"  LLM compressed:  {compressed_size:>6} bytes ({compression_ratio:.2f}x)"
-            )
-            print(
-                f"  ZSTD (level 22):  {zstd_size:>6} bytes ({original_size / zstd_size:.2f}x)"
-            )
-            print(
-                f"  GZIP (level 9):  {gzip_size:>6} bytes ({original_size / gzip_size:.2f}x)"
-            )
-            print(
-                f"  BZ2 (level 9):   {bz2_size:>6} bytes ({original_size / bz2_size:.2f}x)"
-            )
-            print(
-                f"  LZMA (level 9):  {lzma_size:>6} bytes ({original_size / lzma_size:.2f}x)"
-            )
-
-            start = time.time()
-            decompressed = decompress(
-                llm,
-                compressed,
-                # progress_callback=lambda c, t: print_progress(c, t, "Decompressing"),
-            )
-            end = time.time()
-            matches = decompressed == text
-            print(f"Decompressed correctly? {matches}")
-            if not matches:
-                print(f"\nOriginal length: {len(text)}")
-                print(f"Decompressed length: {len(decompressed)}")
-                print(f"Decompressed in {end - start:.2f} seconds")
-                # Find first difference
-                for i, (c1, c2) in enumerate(zip(text, decompressed)):
-                    if c1 != c2:
-                        print(f"First difference at position {i}:")
-                        print(f"  Expected: {repr(text[max(0, i - 20) : i + 20])}")
-                        print(
-                            f"  Got:      {repr(decompressed[max(0, i - 20) : i + 20])}"
-                        )
-                        break
-            assert decompressed == text
+            compress_and_compare(llm, text)
 
 
 if __name__ == "__main__":
