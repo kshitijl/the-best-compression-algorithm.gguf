@@ -14,11 +14,9 @@ import numpy as np
 import zstd
 
 
-PRECISION = 32  # use 32bit presision b/c it fits in 64 (so overflow is easy to detect) & math is easier
-MAX_RANGE = 1 << PRECISION  # 2^32
-HALF = 1 << (PRECISION - 1)  # 2^31
-QUARTER = 1 << (PRECISION - 2)  # 2^30
-THREE_QUARTERS = 3 * QUARTER  # 3 * 2^30
+PRECISION = 64  # use 32bit presision b/c it fits in 64 (so overflow is easy to detect) & math is easier
+MAX_RANGE = np.uint64(0xFFFFFFFFFFFFFFFF)
+hi_order_bit_mask = 0x8000000000000000
 
 WINDOW_SIZE = 64  # this is the max number of tokens we will send to the LLM before resetting the context
 
@@ -102,9 +100,10 @@ def compress(
     lo = np.uint64(0)
     hi = np.uint64(MAX_RANGE)
     output_bits = []
-    underflow_count = 0
 
     for i, token in enumerate(tokens):
+        token_str = llm.detokenize([token]).decode("utf-8", errors="replace")
+        print(f"token: {token_str}")
         if progress_callback:
             progress_callback(i + 1, total_tokens)
 
@@ -113,40 +112,43 @@ def compress(
         prob_before = np.sum(probs[:token])
         next_token_prob = probs[token]
 
+        assert hi > lo
+        assert (lo & hi_order_bit_mask) != (hi & hi)
+
         # update interval
+        print(f"before update: lo: {lo}, hi: {hi}")
         width = hi - lo
         lo = lo + np.uint64(prob_before * width)
-        hi = lo + max(np.uint64(1), np.uint64(next_token_prob * width))
+        hi = lo + np.uint64(next_token_prob * width)
+        print(f"after update: lo: {lo}, hi: {hi}")
+        print(f"next_token_prob: {next_token_prob}")
+        assert lo != hi
+        assert hi > lo
 
-        # renormalize
-        while True:
-            if hi <= HALF:
-                output_bits.append(0)
-                output_bits.extend([1] * underflow_count)
-                underflow_count = 0
-                lo = lo << 1
-                hi = hi << 1
-            elif lo >= HALF:
-                output_bits.append(1)
-                output_bits.extend([0] * underflow_count)
-                underflow_count = 0
-                lo = (lo - HALF) << 1
-                hi = (hi - HALF) << 1
-            elif lo >= QUARTER and hi <= THREE_QUARTERS:
-                underflow_count += 1
-                lo = (lo - QUARTER) << 1
-                hi = (hi - QUARTER) << 1
-            else:
-                break
+        while (lo & hi_order_bit_mask) == (hi & hi_order_bit_mask):
+            output_bits.append((lo & hi_order_bit_mask) >> 63)
+            lo = lo << 1
+            hi = hi << 1
 
-    # flush remaining bits
-    underflow_count += 1
-    if lo < QUARTER:
-        output_bits.append(0)
-        output_bits.extend([1] * underflow_count)
-    else:
-        output_bits.append(1)
-        output_bits.extend([0] * underflow_count)
+        print(f"after renormalize: lo: {lo}, hi: {hi}")
+
+        assert hi > lo
+        assert (lo & hi_order_bit_mask) != (hi & hi_order_bit_mask)
+
+    # while hi != 0:
+    #     output_bits.append((hi & hi_order_bit_mask) >> 63)
+    #     hi = hi << 1
+
+    # lo = lo + 1
+    # while lo != 0:
+    #     output_bits.append((lo & hi_order_bit_mask) >> 63)
+    #     lo = lo << 1
+
+    remain = hi // 2 + lo // 2
+
+    while remain != 0:
+        output_bits.append((remain & hi_order_bit_mask) >> 63)
+        remain = remain << 1
 
     compressed_bytes = bits_to_bytes(output_bits)
 
@@ -165,12 +167,12 @@ def decompress(
     llm.reset()
 
     # read initial val from bitstream
-    value = np.uint64(0)
+    current_window = np.uint64(0)
     bit_index = 0
     for _ in range(PRECISION):
-        value = value << 1
+        current_window = current_window << 1
         if bit_index < len(bits):
-            value = value | bits[bit_index]
+            current_window = current_window | bits[bit_index]
             bit_index += 1
 
     lo = np.uint64(0)
@@ -183,19 +185,17 @@ def decompress(
         probs = get_token_probs(llm, decompressed_tokens)
 
         width = hi - lo
-        position = (value - lo) / width
+        position = (current_window - lo) / width
 
         # Clamp position to valid range [0, 1) to prevent out-of-bounds
         if position < 0:
             print(
-                f"\nWARNING: position < 0 at token {i}: {position}, value={value}, lo={lo}, hi={hi}"
+                f"\nWARNING: position < 0 at token {i}: {position}, value={current_window}, lo={lo}, hi={hi}"
             )
-            position = 0
         elif position >= 1.0:
             print(
-                f"\nWARNING: position >= 1.0 at token {i}: {position}, value={value}, lo={lo}, hi={hi}"
+                f"\nWARNING: position >= 1.0 at token {i}: {position}, value={current_window}, lo={lo}, hi={hi}"
             )
-            position = 0.9999999
 
         cdf = np.cumsum(probs)
         token = np.searchsorted(cdf, position, side="right")
@@ -204,35 +204,30 @@ def decompress(
         prob_before = np.sum(probs[:token])
         prob_token = probs[token]
 
+        token_str = llm.detokenize([token]).decode("utf-8", errors="replace")
+        print(f"token: {token_str}")
+        if i == compressed.num_tokens - 1:
+            print(
+                llm.detokenize(
+                    [token - 2, token - 1, token, token + 1, token + 2]
+                ).decode("utf-8", errors="replace")
+            )
         # update interval
+        print(f"before update: lo: {lo}, hi: {hi}")
         lo = lo + np.uint64(prob_before * width)
-        hi = lo + max(np.uint64(1), np.uint64(prob_token * width))
+        hi = lo + np.uint64(prob_token * width)
+        print(f"after update: lo: {lo}, hi: {hi}")
+        print(f"next_token_prob: {prob_token}")
 
-        # renormalize
-        while True:
-            if hi <= HALF:
-                lo = lo << 1
-                hi = hi << 1
-                value = value << 1
-                if bit_index < len(bits):
-                    value = value | bits[bit_index]
-                    bit_index += 1
-            elif lo >= HALF:
-                lo = (lo - HALF) << 1
-                hi = (hi - HALF) << 1
-                value = (value - HALF) << 1
-                if bit_index < len(bits):
-                    value = value | bits[bit_index]
-                    bit_index += 1
-            elif lo >= QUARTER and hi <= THREE_QUARTERS:
-                lo = (lo - QUARTER) << 1
-                hi = (hi - QUARTER) << 1
-                value = (value - QUARTER) << 1
-                if bit_index < len(bits):
-                    value = value | bits[bit_index]
-                    bit_index += 1
-            else:
-                break
+        while (lo & hi_order_bit_mask) == (hi & hi_order_bit_mask):
+            lo = lo << 1
+            hi = hi << 1
+            current_window = current_window << 1
+            if bit_index < len(bits):
+                current_window = current_window | bits[bit_index]
+                bit_index += 1
+
+        print(f"after renormalize: lo: {lo}, hi: {hi}")
 
     return llm.detokenize(decompressed_tokens).decode("utf-8", errors="replace")
 
@@ -348,14 +343,30 @@ def main():
     ]
 
     texts = [
-        "hello world",
-        "The capital of the United States is Washington, D.C.",
-        "tdoajpwdojaw podfjawpofjawpfojawpfojawpfojawfpoawjfpoawjfpoawjfpawofjawpofjawpofjawpofjawpofjawpofjawpofjawfpoa",
-        "".join(
-            random.choices(
-                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=200
-            )
-        ),
+        # "hello world",
+        # "The capital of the United States is Washington, D.C.",
+        # "tdoajpwdojaw podfjawpofjawpfojawpfojawpfojawfpoawjfpoawjfpoawjfpawofjawpofjawpofjawpofjawpofjawpofjawpofjawfpoa",
+        # "".join(
+        #     random.choices(
+        #         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=200
+        #     )
+        # ),
+        #         """"/**
+        #  * Copyright (c) Meta Platforms, Inc. and affiliates.
+        #  *
+        #  * This source code is licensed under the MIT license found in the
+        #  * LICENSE file in the root directory of this source tree.
+        #  *
+        #  * @flow
+        #  */
+        # // Keep in sync with ReactServerConsoleConfig
+        # const badgeFormat = '%c%s%c';
+        # // Same badge styling as DevTools.
+        # const badgeStyle =
+        #   // We use a fixed background if light-dark is not supported, otherwise
+        #   // we use a transparent background.
+        #   # 'background: #e6e6e6;' +
+        # """,
         """In information theory, data compression, source coding,[1] or bit-rate reduction is the process of encoding information using fewer bits than the original representation.[2] Any particular compression is either lossy or lossless. Lossless compression reduces bits by identifying and eliminating statistical redundancy. No information is lost in lossless compression. Lossy compression reduces bits by removing unnecessary or less important information.[3] Typically, a device that performs data compression is referred to as an encoder, and one that performs the reversal of the process (decompression) as a decoder.
         The process of reducing the size of a data file is often referred to as data compression. In the context of data transmission, it is called source coding: encoding is done at the source of the data before it is stored or transmitted.[4] Source coding should not be confused with channel coding, for error detection and correction or line coding, the means for mapping data onto a signal.
         Data compression algorithms present a space–time complexity trade-off between the bytes needed to store or transmit information, and the computational resources needed to perform the encoding and decoding. The design of data compression schemes involves balancing the degree of compression, the amount of distortion introduced (when using lossy data compression), and the computational resources or time required to compress and decompress the data.[5] """,
